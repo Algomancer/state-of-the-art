@@ -20,8 +20,6 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torchvision.datasets import MNIST
-
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 DATA_DIR = SCRIPT_DIR.parent / "gng" / "data"
@@ -47,31 +45,6 @@ class Config:
     pixel_threshold: float = 0.20
     seed: int = 0
 
-
-# =============================================================================
-# Binarized MNIST
-# =============================================================================
-
-def binary_mnist(
-    *,
-    train: bool,
-    count: int,
-    image_side: int,
-    threshold: float,
-    seed: int,
-) -> tuple[Tensor, Tensor]:
-    """Return a deterministic subset in ART 1's binary input domain."""
-
-    dataset = MNIST(DATA_DIR, train=train, download=True)
-    generator = torch.Generator().manual_seed(seed)
-    index = torch.randperm(len(dataset), generator=generator)[:count]
-    images = dataset.data[index].float().unsqueeze(1) / 255.0
-    labels = dataset.targets[index]
-
-    pooling = 28 // image_side
-    images = F.avg_pool2d(images, kernel_size=pooling, stride=pooling)
-    patterns = (images >= threshold).to(torch.get_default_dtype())
-    return patterns.flatten(1), labels
 
 
 
