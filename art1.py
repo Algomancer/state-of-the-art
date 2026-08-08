@@ -21,8 +21,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-DATA_DIR = SCRIPT_DIR.parent / "gng" / "data"
+SCRIPT_DIR = Path(__file__)
+DATA_DIR = SCRIPT_DIR
 OUT = SCRIPT_DIR / "out"
 
 DATA = "#4c78a8"
