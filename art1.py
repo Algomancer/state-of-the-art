@@ -1,11 +1,14 @@
-"""
-Carpenter and Grossberg (1987), "A Massively Parallel
-Architecture for a Self-Organizing Neural Pattern Recognition Machine."
+"""ART 1 as a stateful, graph-friendly PyTorch layer.
 
-In training mode, ``forward`` runs
-the order-sensitive ART recurrence, updates the registered category
-buffers once, then returns the batch response under the new state. In evaluation
-mode, ``forward`` is a read-only vectorized category function. 
+ART 1 learns a winner-take-all function on binary inputs.
+
+The runnable experiment learns directly from a deterministic subset of the
+official MNIST train split, then freezes the layer and measures its category
+function on the official test split. 
+
+Primary source: Carpenter and Grossberg (1987), "A Massively Parallel
+Architecture for a Self-Organizing Neural Pattern Recognition Machine."
+https://sites.bu.edu/steveg/files/2016/06/CarGro1987CVGIP.pdf
 """
 
 from dataclasses import dataclass
@@ -20,9 +23,11 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torchvision.datasets import MNIST
 
-SCRIPT_DIR = Path(__file__)
-DATA_DIR = SCRIPT_DIR
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+DATA_DIR = SCRIPT_DIR.parent / "gng" / "data"
 OUT = SCRIPT_DIR / "out"
 
 DATA = "#4c78a8"
@@ -46,6 +51,30 @@ class Config:
     seed: int = 0
 
 
+# =============================================================================
+# Binarized MNIST
+# =============================================================================
+
+def binary_mnist(
+    *,
+    train: bool,
+    count: int,
+    image_side: int,
+    threshold: float,
+    seed: int,
+) -> tuple[Tensor, Tensor]:
+    """Return a deterministic subset in ART 1's binary input domain."""
+
+    dataset = MNIST(DATA_DIR, train=train, download=True)
+    generator = torch.Generator().manual_seed(seed)
+    index = torch.randperm(len(dataset), generator=generator)[:count]
+    images = dataset.data[index].float().unsqueeze(1) / 255.0
+    labels = dataset.targets[index]
+
+    pooling = 28 // image_side
+    images = F.avg_pool2d(images, kernel_size=pooling, stride=pooling)
+    patterns = (images >= threshold).to(torch.get_default_dtype())
+    return patterns.flatten(1), labels
 
 
 def art1_choice_match(
@@ -83,7 +112,9 @@ class ART1Output(NamedTuple):
 # =============================================================================
 
 class ART1(nn.Module):
-    r"""A fast-learning Adaptive Resonance Theory layer for binary inputs.
+    r"""A Adaptive Resonance Theory layer for binary inputs.
+
+    :meth:`~torch.nn.Module.state_dict` and :meth:`~torch.nn.Module.to`.
 
     Args:
         in_features: Number of binary features in each input.
@@ -133,16 +164,6 @@ class ART1(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        if in_features <= 0:
-            raise ValueError(f"in_features must be positive, got {in_features}")
-        if num_categories <= 0:
-            raise ValueError(
-                f"num_categories must be positive, got {num_categories}"
-            )
-        if not 0.0 <= vigilance <= 1.0:
-            raise ValueError(f"vigilance must be in [0, 1], got {vigilance}")
-        if choice_gain <= 1.0:
-            raise ValueError(f"choice_gain must be greater than 1, got {choice_gain}")
         self.in_features = in_features
         self.num_categories = num_categories
         self.vigilance = vigilance
@@ -276,61 +297,108 @@ class ART1(nn.Module):
 # =============================================================================
 
 @torch.no_grad()
-def train(cfg: Config) -> tuple[Tensor, ART1]:
-    """Present each noisy binary pattern once in deterministic order."""
+def fit(layer: ART1, patterns: Tensor, cfg: Config) -> None:
+    """Present the MNIST patterns once, in order, through a compiled graph."""
 
-    train_input, _, clean_prototype = noisy_shapes(
-        cfg.train_samples,
-        cfg.side,
-        cfg.maximum_extra_pixels,
-        cfg.seed,
-    )
-    layer = ART1(
-        in_features=train_input.shape[-1],
-        num_categories=cfg.max_categories,
-        vigilance=cfg.vigilance,
-        choice_gain=cfg.choice_gain,
-    )
+    compiled_layer = torch.compile(layer, fullgraph=True)
     seen = 0
-
-    for batch in train_input.split(200):
-        layer(batch)
+    for batch in patterns.split(cfg.batch_size):
+        compiled_layer(batch.to(layer.prototype.device))
         seen += batch.shape[0]
-        print(
-            f"ART1  samples={seen:>3d}/{cfg.train_samples}  "
-            f"categories={layer.num_committed}",
-            flush=True,
-        )
+        if seen % 1_024 == 0 or seen == patterns.shape[0]:
+            print(
+                f"ART1  samples={seen:>4d}/{patterns.shape[0]}  "
+                f"categories={layer.num_committed}",
+                flush=True,
+            )
 
-    return clean_prototype, layer
+
+class FrozenResponses(NamedTuple):
+    category: Tensor
+    winning_match: Tensor
 
 
-def category_concepts(layer: ART1, concepts: Tensor) -> tuple[Tensor, Tensor]:
-    """Name each committed category by its best-matching clean concept."""
+@torch.no_grad()
+def frozen_responses(
+    layer: ART1,
+    patterns: Tensor,
+    batch_size: int,
+) -> FrozenResponses:
+    """Evaluate without retaining the large per-category score matrices."""
 
-    category = torch.where(layer.committed)[0]
-    intersection = torch.minimum(
-        concepts[:, None, :],
-        layer.prototype[category][None, :, :],
+    categories = []
+    winning_matches = []
+    for batch in patterns.split(batch_size):
+        output = layer(batch.to(layer.prototype.device))
+        winner = output.category.clamp_min(0).unsqueeze(-1)
+        winning_match = output.match.gather(-1, winner).squeeze(-1)
+        winning_match = winning_match.masked_fill(output.category < 0, torch.nan)
+        categories.append(output.category.cpu())
+        winning_matches.append(winning_match.cpu())
+    return FrozenResponses(
+        torch.cat(categories),
+        torch.cat(winning_matches),
     )
-    match = intersection.sum(dim=-1) / concepts.sum(dim=-1, keepdim=True)
-    return category, match.argmax(dim=0)
 
 
-def response_confusion(
-    true_label: Tensor,
+def category_label_counts(
     category: Tensor,
-    committed: Tensor,
+    label: Tensor,
+    num_categories: int,
 ) -> Tensor:
-    """Count frozen category outputs for each ground-truth concept."""
+    """Post-hoc labels for interpreting an otherwise unsupervised memory."""
 
-    column = torch.searchsorted(committed, category.clamp_min(0))
-    column = column.masked_fill(category < 0, committed.numel())
-    flat_index = true_label * (committed.numel() + 1) + column
+    accepted = category >= 0
+    flat_index = category[accepted] * 10 + label[accepted]
     return torch.bincount(
         flat_index,
-        minlength=3 * (committed.numel() + 1),
-    ).reshape(3, committed.numel() + 1)
+        minlength=num_categories * 10,
+    ).reshape(num_categories, 10)
+
+
+@dataclass(frozen=True)
+class Metrics:
+    coverage: float
+    conditional_accuracy: float
+    total_accuracy: float
+    train_purity: float
+    mean_match: float
+    occupied_categories: int
+
+
+def evaluate(
+    responses: FrozenResponses,
+    labels: Tensor,
+    train_counts: Tensor,
+) -> tuple[Metrics, Tensor]:
+    """Measure the frozen category function using post-hoc majority labels."""
+
+    majority_label = train_counts.argmax(dim=-1)
+    accepted = responses.category >= 0
+    prediction = labels.new_full(labels.shape, -1)
+    prediction[accepted] = majority_label[responses.category[accepted]]
+    correct = prediction == labels
+
+    confusion_column = prediction.masked_fill(~accepted, 10)
+    confusion = torch.bincount(
+        labels * 11 + confusion_column,
+        minlength=10 * 11,
+    ).reshape(10, 11)
+    labelled = train_counts.sum()
+    metrics = Metrics(
+        coverage=float(accepted.float().mean()),
+        conditional_accuracy=float(correct[accepted].float().mean()),
+        total_accuracy=float(correct.float().mean()),
+        train_purity=float(train_counts.amax(dim=-1).sum() / labelled),
+        mean_match=float(responses.winning_match.nanmean()),
+        occupied_categories=int(
+            torch.bincount(
+                responses.category[accepted],
+                minlength=train_counts.shape[0],
+            ).count_nonzero()
+        ),
+    )
+    return metrics, confusion
 
 
 # =============================================================================
@@ -356,100 +424,82 @@ def draw_binary_pattern(
 
 
 def render(
-    concepts: Tensor,
     layer: ART1,
-    evaluation_label: Tensor,
-    output: ART1Output,
-    committed: Tensor,
-    category_name: Tensor,
+    responses: FrozenResponses,
+    train_counts: Tensor,
+    confusion: Tensor,
+    metrics: Metrics,
     cfg: Config,
     path: Path,
 ) -> None:
-    """Show learned templates and held-out category-function responses."""
+    """Show occupied logical-AND templates and the held-out function."""
 
-    names = ("vertical", "horizontal", "diagonal")
-    categories = committed.numel()
-    category_to_concept = output.category.new_full(
-        (layer.num_categories,),
-        -1,
+    accepted = responses.category >= 0
+    occupancy = torch.bincount(
+        responses.category[accepted],
+        minlength=layer.num_categories,
     )
-    category_to_concept[committed] = category_name
-    accepted = output.category >= 0
-    mapped = output.category.new_full(output.category.shape, -1)
-    mapped[accepted] = category_to_concept[output.category[accepted]]
-    accuracy = float((mapped == evaluation_label).float().mean())
-    coverage = float(accepted.float().mean())
-    winning_match = output.match.gather(
-        -1,
-        output.category.clamp_min(0).unsqueeze(-1),
-    ).squeeze(-1)
-    mean_match = float(winning_match[accepted].mean())
-    confusion = response_confusion(
-        evaluation_label,
-        output.category,
-        committed,
-    )
+    shown = occupancy.topk(min(32, int(occupancy.count_nonzero()))).indices
+    majority_label = train_counts.argmax(dim=-1)
 
-    figure = plt.figure(figsize=(14, 7), constrained_layout=True)
-    grid = figure.add_gridspec(2, 2, width_ratios=(1.6, 1.0))
-    concept_grid = grid[0, 0].subgridspec(1, 3)
-    category_grid = grid[1, 0].subgridspec(1, categories)
+    figure = plt.figure(figsize=(16, 9), constrained_layout=True)
+    grid = figure.add_gridspec(1, 2, width_ratios=(1.8, 1.0))
+    category_grid = grid[0, 0].subgridspec(4, 8)
 
-    for index, name in enumerate(names):
-        axis = figure.add_subplot(concept_grid[0, index])
-        draw_binary_pattern(axis, concepts[index], cfg.side, DATA)
-        axis.set_title(f"input concept\n{name}", fontsize=10)
-
-    for index in range(categories):
-        axis = figure.add_subplot(category_grid[0, index])
-        category = int(committed[index].item())
+    for plot_index, category_tensor in enumerate(shown):
+        axis = figure.add_subplot(category_grid[plot_index // 8, plot_index % 8])
+        category = int(category_tensor)
         draw_binary_pattern(
             axis,
             layer.prototype[category],
-            cfg.side,
+            cfg.image_side,
             CODES,
         )
         critical = int(layer.prototype[category].sum().item())
-        name = names[int(category_name[index].item())]
         axis.set_title(
-            f"category {category} -> {name}\n{critical} critical ON pixels",
-            fontsize=10,
+            f"j={category}  digit~{int(majority_label[category])}\n"
+            f"test n={int(occupancy[category])}, |t|={critical}",
+            fontsize=8,
         )
 
-    matrix_axis = figure.add_subplot(grid[:, 1])
-    matrix_axis.imshow(confusion.cpu().numpy(), cmap="Blues", aspect="auto")
-    dark_text_threshold = int(confusion.max().item()) / 2
-    for row in range(confusion.shape[0]):
-        for column in range(confusion.shape[1]):
-            value = int(confusion[row, column].item())
+    matrix_axis = figure.add_subplot(grid[0, 1])
+    rate = confusion / confusion.sum(dim=-1, keepdim=True).clamp_min(1)
+    matrix_axis.imshow(rate.numpy(), cmap="Blues", vmin=0.0, vmax=1.0)
+    for row in range(10):
+        for column in range(11):
+            value = float(rate[row, column])
+            if value < 0.01:
+                continue
             matrix_axis.text(
                 column,
                 row,
-                str(value),
+                f"{value:.0%}",
                 ha="center",
                 va="center",
-                color="white" if value > dark_text_threshold else "#222222",
-                fontsize=10,
+                color="white" if value > 0.5 else "#222222",
+                fontsize=8,
             )
-    matrix_axis.set_yticks(range(3), names)
+    matrix_axis.set_yticks(range(10), range(10))
     matrix_axis.set_xticks(
-        range(categories + 1),
-        [f"category {int(index.item())}" for index in committed] + ["reject"],
-        rotation=30,
-        ha="right",
+        range(11),
+        [str(digit) for digit in range(10)] + ["reject"],
     )
-    matrix_axis.set_xlabel("frozen ART 1 output")
-    matrix_axis.set_ylabel("held-out noisy input concept")
+    matrix_axis.set_xlabel("post-hoc majority label of frozen category")
+    matrix_axis.set_ylabel("MNIST test label")
     matrix_axis.set_title(
-        "The learned Boolean function\n"
-        f"coverage={coverage:.1%}, accuracy={accuracy:.1%}, "
-        f"mean match={mean_match:.3f}",
+        "Held-out category function\n"
+        f"coverage={metrics.coverage:.1%}, "
+        f"accuracy | accepted={metrics.conditional_accuracy:.1%}\n"
+        f"total accuracy={metrics.total_accuracy:.1%}, "
+        f"mean match={metrics.mean_match:.3f}",
         fontsize=11,
     )
 
     figure.suptitle(
-        "ART 1: choice -> template match -> reset or logical-AND update\n"
-        f"rho={cfg.vigilance:.2f}, {categories} learned categories",
+        "ART 1 on binarized MNIST: choose -> test vigilance -> reset or intersect\n"
+        f"rho={cfg.vigilance:.2f}, {layer.num_committed} committed, "
+        f"{metrics.occupied_categories} occupied on test, "
+        f"post-hoc train purity={metrics.train_purity:.1%}",
         fontsize=15,
     )
     figure.savefig(path, dpi=170, bbox_inches="tight")
@@ -464,24 +514,58 @@ def render(
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
     config = Config()
-    clean_concept, art1 = train(config)
-    evaluation_input, evaluation_label, _ = noisy_shapes(
-        config.evaluation_samples,
-        config.side,
-        config.maximum_extra_pixels,
-        config.seed + 1,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_input, train_label = binary_mnist(
+        train=True,
+        count=config.train_samples,
+        image_side=config.image_side,
+        threshold=config.pixel_threshold,
+        seed=config.seed,
     )
+    evaluation_input, evaluation_label = binary_mnist(
+        train=False,
+        count=config.evaluation_samples,
+        image_side=config.image_side,
+        threshold=config.pixel_threshold,
+        seed=config.seed + 1,
+    )
+    art1 = ART1(
+        in_features=train_input.shape[-1],
+        num_categories=config.max_categories,
+        vigilance=config.vigilance,
+        choice_gain=config.choice_gain,
+        device=device,
+    )
+    fit(art1, train_input, config)
     art1.eval()
-    evaluation_output = art1(evaluation_input)
-    committed_category, concept = category_concepts(art1, clean_concept)
-    render(
-        clean_concept,
+    train_responses = frozen_responses(art1, train_input, config.batch_size)
+    evaluation_responses = frozen_responses(
         art1,
+        evaluation_input,
+        config.batch_size,
+    )
+    train_counts = category_label_counts(
+        train_responses.category,
+        train_label,
+        art1.num_categories,
+    )
+    metrics, confusion = evaluate(
+        evaluation_responses,
         evaluation_label,
-        evaluation_output,
-        committed_category,
-        concept,
+        train_counts,
+    )
+    render(
+        art1,
+        evaluation_responses,
+        train_counts,
+        confusion,
+        metrics,
         config,
         OUT / "art1_function.png",
     )
-    print(f"done  categories={art1.num_committed}", flush=True)
+    print(
+        f"done  device={device}  categories={art1.num_committed}  "
+        f"coverage={metrics.coverage:.1%}  "
+        f"accuracy={metrics.total_accuracy:.1%}",
+        flush=True,
+    )
